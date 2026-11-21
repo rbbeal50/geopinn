@@ -94,10 +94,12 @@ class AcousticWave(PDE):
         return self._displacement_residual(x, t, fields), self._velocity_residual(x, t, fields)
 
     def _pde_residual(self, x: Tensor, t: Tensor, fields: Fields) -> Tensor:
-        # Acoustic wave equation, strong form:
-        #   ∂²u/∂t² - c(x, t)² ∇²u - s = 0.
-        # Homogeneous 1D problem used in this increment, constant c, s = 0:
-        #   u_tt - c² u_xx = 0.
+        # Acoustic wave equation, constant-density strong form:
+        #   u_tt - c(x, t)² ∇²u - s = 0.
+        # 1D: u_tt - c² u_xx = 0.  2D columns of x are (x, z):
+        #   u_tt - c(x, z)² (u_xx + u_zz) - s = 0.
+        # A Python float stays a plain multiply. A tensor or callable is the
+        # same line, so a Gassmann map or a trainable c(x, z) plugs in here.
         field = fields["u"]
         u_tt = second_partial(field, t)
         lap = laplacian(field, x)

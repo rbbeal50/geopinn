@@ -15,6 +15,7 @@ import torch
 from torch import Tensor, nn
 
 from geopinn.config import WaveSpeedSpec
+from geopinn.physics.speeds import layered_speed_hat
 
 # Float, a (possibly trainable) tensor, or a map of the collocation points.
 # One-argument callables receive x. Two-argument callables receive (x, t).
@@ -30,22 +31,46 @@ class CoefficientNotBuilt(RuntimeError):
     """
 
 
-def resolve_wave_speed(spec: WaveSpeedSpec, c_hat: float) -> float:
-    """Return the nondimensional constant speed, or refuse a field spec.
+def resolve_wave_speed(
+    spec: WaveSpeedSpec,
+    c_hat: float,
+    *,
+    length: float = 1.0,
+    time: float = 1.0,
+) -> CoeffLike:
+    """Build the speed the residual evaluates, or refuse a field spec.
 
-    ``c_hat`` is ``c T / L`` from :class:`geopinn.nondim.Scales`. Only the
-    constant form is built here. The returned float stays a Python float so
-    the constant-coefficient residual is a plain multiply, which is the same
-    contraction the 1D benchmark was verified with.
+    ``constant`` returns the nondimensional float ``c_hat = c T / L``. The
+    returned value stays a Python float so the constant-coefficient residual
+    is a plain multiply, which is the contraction the 1D benchmark was
+    verified with.
+
+    ``layered`` returns a callable ``c_hat(x, z)`` of the nondimensional
+    coordinates. ``length`` and ``time`` are the reference scales ``Lx`` and
+    ``T``. ``field`` is the slot for a trainable ``c(x, z)`` or a rock-physics
+    map and is not built here.
     """
     if spec.form == "constant":
         if c_hat <= 0.0:
             raise ValueError("nondimensional wave speed must be positive")
         return c_hat
+    if spec.form == "layered":
+        if spec.c_top is None or spec.c_bottom is None or spec.interface is None:
+            raise CoefficientNotBuilt("layered wave speed is missing its layer parameters")
+        if spec.transition is None:
+            raise CoefficientNotBuilt("layered wave speed is missing its transition width")
+        return layered_speed_hat(
+            c_top=spec.c_top,
+            c_bottom=spec.c_bottom,
+            interface=spec.interface,
+            transition=spec.transition,
+            length=length,
+            time=time,
+        )
     source = spec.source or "<unnamed>"
     raise CoefficientNotBuilt(
         "coefficients.wave_speed.form is 'field' "
-        f"(source {source!r}). A trainable c(x) or a rock-physics map is not "
+        f"(source {source!r}). A trainable c(x, z) or a rock-physics map is not "
         "built by this trainer yet. Pass a tensor or a callable as "
         "AcousticWave(wave_speed=...) ; the residual already evaluates it."
     )

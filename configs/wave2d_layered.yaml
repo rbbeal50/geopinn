@@ -1,0 +1,81 @@
+# Heterogeneous 2D forward problem. Soft constraints.
+# A smooth two-layer speed (constant-density strong form)
+#   u_tt = c(z)^2 (u_xx + u_zz)
+#   c(z) = (c_top + c_bottom) / 2
+#        + (c_bottom - c_top) / 2 * tanh((z - z_int) / w)
+# with a windowed Gaussian initial pulse, zero initial velocity, and no source.
+# problem.wave_speed is only the reference used for the O(1) check; the
+# residual evaluates the layered profile.
+#
+# Sine units, not Fourier features: a sigma of 2.5 made the initial velocity
+# enormous and the network collapsed toward the zero field, which has a zero
+# residual when the source is zero. Causal Adam (Wang, Sankaran, Perdikaris
+# 2022) fits the early residual before the reflection. L-BFGS then minimizes
+# the plain mean square. The initial slice is sampled more densely than the
+# boundary because that is where the pulse lives.
+seed: 0
+device: cpu
+log_every: 200
+checkpoint: outputs/checkpoints/wave2d_layered.pt
+constraints: soft
+
+problem:
+  spatial_dim: 2
+  length: 1.0
+  depth: 1.0
+  time_final: 0.4
+  wave_speed: 1.5
+  amplitude: 1.0
+  boundary: dirichlet
+  dirichlet_value: 0.0
+  ic: gaussian
+  initial_velocity: 0.0
+  gaussian_center: 0.35
+  gaussian_width: 0.08
+  gaussian_center_z: 0.28
+  gaussian_width_z: 0.08
+
+coefficients:
+  wave_speed:
+    form: layered
+    c_top: 1.0
+    c_bottom: 1.5
+    interface: 0.55
+    transition: 0.08
+
+network:
+  field_names: [u]
+  hidden_layers: 5
+  hidden_dim: 64
+  activation: sin
+  sine_omega: 1.0
+  fourier_features: 0
+  fourier_sigma: 1.0
+
+sampling:
+  n_interior: 8192
+  n_boundary_per_side: 512
+  n_initial: 2048
+  method: sobol
+
+loss:
+  weights:
+    pde: 1.0
+    bc: 100.0
+    ic_u: 500.0
+    ic_ut: 100.0
+    data: 0.0
+  balance: none
+  causal: true
+  causal_epsilon: 1.0
+  causal_bins: 8
+
+optim:
+  adam_steps: 2000
+  adam_lr: 0.001
+  adam_lr_gamma: 0.2
+  adam_lr_step_frac: 0.6
+  lbfgs_steps: 400
+  lbfgs_lr: 1.0
+  lbfgs_history: 40
+  lbfgs_line_search_evals: 15

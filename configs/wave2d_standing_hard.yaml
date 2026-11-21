@@ -1,0 +1,66 @@
+# Same standing wave as wave2d_standing_soft.yaml, with the product of sines
+# built into the trial function:
+#   u = sin(pi x) sin(pi z) (1 + t^2 N_theta)
+# Homogeneous Dirichlet data and both initial conditions hold exactly, so the
+# trainer zeros bc, ic_u, and ic_ut and minimizes the PDE residual.
+seed: 0
+device: cpu
+log_every: 200
+checkpoint: outputs/checkpoints/wave2d_standing_hard.pt
+constraints: hard
+constraint_form: modal_sine
+
+problem:
+  spatial_dim: 2
+  length: 1.0
+  depth: 1.0
+  time_final: 1.0
+  wave_speed: 1.0
+  amplitude: 1.0
+  boundary: dirichlet
+  dirichlet_value: 0.0
+  ic: sine
+  mode_x: 1
+  mode_z: 1
+  initial_velocity: 0.0
+  gaussian_center: 0.5
+  gaussian_width: 0.12
+
+coefficients:
+  wave_speed:
+    form: constant
+
+network:
+  field_names: [u]
+  hidden_layers: 4
+  hidden_dim: 64
+  activation: tanh
+  sine_omega: 1.0
+  fourier_features: 0
+  fourier_sigma: 1.0
+
+sampling:
+  n_interior: 4096
+  n_boundary_per_side: 128
+  n_initial: 256
+  method: sobol
+
+loss:
+  weights:
+    pde: 1.0
+    bc: 100.0
+    ic_u: 100.0
+    ic_ut: 100.0
+    data: 0.0
+  balance: none
+  causal: false
+
+optim:
+  adam_steps: 1500
+  adam_lr: 0.001
+  adam_lr_gamma: 0.1
+  adam_lr_step_frac: 0.5
+  lbfgs_steps: 200
+  lbfgs_lr: 1.0
+  lbfgs_history: 50
+  lbfgs_line_search_evals: 20

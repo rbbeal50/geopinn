@@ -13,7 +13,7 @@ ActivationName = Literal["tanh", "sin"]
 SamplerName = Literal["lhs", "sobol"]
 ConstraintMode = Literal["soft", "hard"]
 ConstraintForm = Literal["modal_sine", "polynomial", "none"]
-CoefficientForm = Literal["constant", "field"]
+CoefficientForm = Literal["constant", "field", "layered"]
 BoundaryName = Literal["dirichlet", "neumann", "absorbing"]
 BalanceMode = Literal["none", "wang2021"]
 
@@ -43,6 +43,12 @@ class ProblemConfig:
     initial_velocity: float
     gaussian_center: float
     gaussian_width: float
+    spatial_dim: int = 1
+    depth: float | None = None
+    mode_x: int = 1
+    mode_z: int = 1
+    gaussian_center_z: float | None = None
+    gaussian_width_z: float | None = None
 
 
 @dataclass(frozen=True)
@@ -77,13 +83,18 @@ class WaveSpeedSpec:
     """Where the acoustic speed comes from.
 
     ``constant`` uses ``problem.wave_speed`` (then nondimensionalized).
-    ``field`` reserves ``source`` as the name of a trainable ``c(x)`` or a
-    rock-physics map. The trainer does not build ``field`` yet; the residual
-    already accepts a tensor or a callable in its place.
+    ``layered`` is a smooth two-layer ``c(z)`` (``c_top``, ``c_bottom``,
+    ``interface``, ``transition``). ``field`` reserves ``source`` as the name
+    of a trainable ``c(x, z)`` or a rock-physics map. The trainer does not
+    build ``field`` yet; the residual already accepts a tensor or a callable.
     """
 
     form: CoefficientForm
     source: str | None = None
+    c_top: float | None = None
+    c_bottom: float | None = None
+    interface: float | None = None
+    transition: float | None = None
 
 
 @dataclass(frozen=True)
@@ -107,12 +118,19 @@ class LossConfig:
     the ratio of gradient magnitudes. It is off by default. ``balance_alpha``
     is the paper's mixing rate and ``balance_every`` is how many Adam steps
     pass between updates.
+
+    ``causal`` multiplies the PDE residual by the time-causal weights of Wang,
+    Sankaran, and Perdikaris (2022) during Adam. It is off by default, and
+    L-BFGS always sees the plain mean square.
     """
 
     weights: dict[str, float]
     balance: BalanceMode = "none"
     balance_alpha: float = 0.9
     balance_every: int = 10
+    causal: bool = False
+    causal_epsilon: float = 1.0
+    causal_bins: int = 16
 
 
 @dataclass(frozen=True)
@@ -234,11 +252,28 @@ def _problem(data: dict[str, Any]) -> ProblemConfig:
             "initial_velocity",
             "gaussian_center",
             "gaussian_width",
+            "spatial_dim",
+            "depth",
+            "mode_x",
+            "mode_z",
+            "gaussian_center_z",
+            "gaussian_width_z",
         },
         "problem",
+        optional={
+            "spatial_dim",
+            "depth",
+            "mode_x",
+            "mode_z",
+            "gaussian_center_z",
+            "gaussian_width_z",
+        },
     )
     ic = _req_choice(data, "ic", ("sine", "gaussian"))
     boundary = _req_choice(data, "boundary", ("dirichlet", "neumann", "absorbing"))
+    spatial_dim = _optional_int(data, "spatial_dim", default=1)
+    if spatial_dim not in (1, 2):
+        raise ConfigError("problem.spatial_dim must be 1 or 2")
     return ProblemConfig(
         length=_req_float(data, "length", positive=True),
         time_final=_req_float(data, "time_final", positive=True),
@@ -250,6 +285,12 @@ def _problem(data: dict[str, Any]) -> ProblemConfig:
         initial_velocity=_req_float(data, "initial_velocity"),
         gaussian_center=_req_float(data, "gaussian_center"),
         gaussian_width=_req_float(data, "gaussian_width", positive=True),
+        spatial_dim=spatial_dim,
+        depth=_optional_float_or_none(data, "depth", positive=True),
+        mode_x=_optional_int(data, "mode_x", default=1),
+        mode_z=_optional_int(data, "mode_z", default=1),
+        gaussian_center_z=_optional_float_or_none(data, "gaussian_center_z"),
+        gaussian_width_z=_optional_float_or_none(data, "gaussian_width_z", positive=True),
     )
 
 
@@ -285,14 +326,47 @@ def _coefficients(data: dict[str, Any]) -> CoefficientConfig:
 
 
 def _wave_speed(data: dict[str, Any]) -> WaveSpeedSpec:
-    _check_keys(data, {"form", "source"}, "coefficients.wave_speed", optional={"source"})
-    form = _req_choice(data, "form", ("constant", "field"))
+    _check_keys(
+        data,
+        {"form", "source", "c_top", "c_bottom", "interface", "transition"},
+        "coefficients.wave_speed",
+        optional={"source", "c_top", "c_bottom", "interface", "transition"},
+    )
+    form = _req_choice(data, "form", ("constant", "field", "layered"))
     source = _optional_str(data, "source")
+    c_top = _optional_float_or_none(data, "c_top", positive=True)
+    c_bottom = _optional_float_or_none(data, "c_bottom", positive=True)
+    interface = _optional_float_or_none(data, "interface")
+    transition = _optional_float_or_none(data, "transition", positive=True)
     if form == "constant" and source is not None:
         raise ConfigError("coefficients.wave_speed.source is only used when form is field")
     if form == "field" and source is None:
         raise ConfigError("coefficients.wave_speed.form field requires source")
-    return WaveSpeedSpec(form=cast(CoefficientForm, form), source=source)
+    if form == "layered" and source is not None:
+        raise ConfigError(
+            "coefficients.wave_speed.source is the field-form slot, not a layered profile"
+        )
+    layered_keys = {
+        "c_top": c_top,
+        "c_bottom": c_bottom,
+        "interface": interface,
+        "transition": transition,
+    }
+    if form == "layered":
+        missing = sorted(name for name, value in layered_keys.items() if value is None)
+        if missing:
+            names = ", ".join(missing)
+            raise ConfigError(f"coefficients.wave_speed.form layered requires {names}")
+    elif any(value is not None for value in layered_keys.values()):
+        raise ConfigError("c_top, c_bottom, interface, and transition require form: layered")
+    return WaveSpeedSpec(
+        form=cast(CoefficientForm, form),
+        source=source,
+        c_top=c_top,
+        c_bottom=c_bottom,
+        interface=interface,
+        transition=transition,
+    )
 
 
 def _sampling(data: dict[str, Any]) -> SamplingConfig:
@@ -313,9 +387,24 @@ def _sampling(data: dict[str, Any]) -> SamplingConfig:
 def _loss(data: dict[str, Any]) -> LossConfig:
     _check_keys(
         data,
-        {"weights", "balance", "balance_alpha", "balance_every"},
+        {
+            "weights",
+            "balance",
+            "balance_alpha",
+            "balance_every",
+            "causal",
+            "causal_epsilon",
+            "causal_bins",
+        },
         "loss",
-        optional={"balance", "balance_alpha", "balance_every"},
+        optional={
+            "balance",
+            "balance_alpha",
+            "balance_every",
+            "causal",
+            "causal_epsilon",
+            "causal_bins",
+        },
     )
     balance = cast(
         BalanceMode,
@@ -328,6 +417,9 @@ def _loss(data: dict[str, Any]) -> LossConfig:
         balance=balance,
         balance_alpha=alpha,
         balance_every=every,
+        causal=_optional_bool(data, "causal", default=False),
+        causal_epsilon=_optional_float(data, "causal_epsilon", default=1.0),
+        causal_bins=_optional_int(data, "causal_bins", default=16),
     )
 
 
@@ -401,6 +493,22 @@ def _validate_consistency(
             "the hard trial function enforces homogeneous Dirichlet data and "
             "zero initial velocity; use constraints: soft for other targets"
         )
+    if problem.spatial_dim == 1 and problem.depth is not None:
+        raise ConfigError("problem.depth is the 2D vertical extent; omit it in 1D")
+    if problem.spatial_dim == 1 and (problem.mode_x != 1 or problem.mode_z != 1):
+        raise ConfigError("mode_x and mode_z apply when spatial_dim is 2")
+    if problem.spatial_dim == 1 and (
+        problem.gaussian_center_z is not None or problem.gaussian_width_z is not None
+    ):
+        raise ConfigError("gaussian_center_z and gaussian_width_z apply when spatial_dim is 2")
+    if problem.mode_x < 1 or problem.mode_z < 1:
+        raise ConfigError("mode_x and mode_z must be >= 1")
+    if coefficients.wave_speed.form == "layered" and problem.spatial_dim != 2:
+        raise ConfigError("layered wave speed is a c(z) profile; set problem.spatial_dim: 2")
+    if loss.causal_epsilon <= 0.0:
+        raise ConfigError("loss.causal_epsilon must be positive")
+    if loss.causal_bins < 2:
+        raise ConfigError("loss.causal_bins must be >= 2")
     if sampling.method == "sobol":
         for name, count in (
             ("n_interior", sampling.n_interior),
@@ -459,6 +567,26 @@ def _optional_float(data: dict[str, Any], key: str, *, default: float) -> float:
     if key not in data or data[key] is None:
         return default
     return _req_float(data, key)
+
+
+def _optional_float_or_none(
+    data: dict[str, Any],
+    key: str,
+    *,
+    positive: bool = False,
+) -> float | None:
+    if key not in data or data[key] is None:
+        return None
+    return _req_float(data, key, positive=positive)
+
+
+def _optional_bool(data: dict[str, Any], key: str, *, default: bool) -> bool:
+    if key not in data or data[key] is None:
+        return default
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be a boolean")
+    return value
 
 
 def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:

@@ -23,10 +23,18 @@ class Scales:
 
         u'_t't' = (c T / L)² u'_x'x'.
 
-    ``c_hat = c T / L`` should be O(1). Otherwise the PDE residual is dominated
-    by the choice of units rather than by the approximation error. Training
-    always happens in the primed coordinates on the unit interval; physical
-    fields are recovered by multiplying by ``U``.
+    In 2D the same reference length scales both coordinates,
+
+        x = L x',   z = L z',   t = T t',   u = U u',
+
+    with ``z' ∈ [0, Lz / L]``. The residual the network sees is
+
+        u'_t't' = c_hat(x', z')² (u'_x'x' + u'_z'z'),
+
+    and ``c_hat = c T / L`` should be O(1). A rectangle that is not a square
+    is a training box whose second side is ``z_extent``, not a second wave
+    speed. Training always happens in the primed coordinates; physical fields
+    are recovered by multiplying by ``U``.
     """
 
     def __init__(
@@ -36,18 +44,28 @@ class Scales:
         time: float,
         amplitude: float,
         wave_speed: float,
+        depth: float | None = None,
     ) -> None:
         if length <= 0.0 or time <= 0.0 or wave_speed <= 0.0 or amplitude <= 0.0:
             raise ValueError("length, time, wave_speed, and amplitude must be positive")
+        if depth is not None and depth <= 0.0:
+            raise ValueError("depth must be positive")
         self.length = float(length)
         self.time = float(time)
         self.amplitude = float(amplitude)
         self.wave_speed = float(wave_speed)
+        # ``depth`` is the physical Lz. It defaults to Lx, a square.
+        self.depth = float(length if depth is None else depth)
 
     @property
     def c_hat(self) -> float:
-        """Nondimensional wave speed ``c T / L``."""
+        """Nondimensional wave speed ``c T / L`` along the reference length."""
         return self.wave_speed * self.time / self.length
+
+    @property
+    def z_extent(self) -> float:
+        """Nondimensional depth of the training box, ``Lz / Lx``."""
+        return self.depth / self.length
 
     def x_hat(self, x: Tensor) -> Tensor:
         return x / self.length
