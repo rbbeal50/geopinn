@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geopinn"
-version = "0.1.0"
+version = "0.2.0"
 description = "Physics-informed neural networks for geophysical forward and inverse problems"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -59,4 +59,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not slow'"
+markers = [
+    "slow: fine-grid studies and short training runs that are not part of the default suite",
+]

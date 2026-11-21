@@ -2,7 +2,7 @@
 
 Physics-informed neural networks for geophysical forward and inverse problems, written in plain PyTorch. No DeepXDE or other PINN libraries.
 
-The first increment solves the **1D acoustic wave equation** forward in time and checks the network against d'Alembert's formula and a second-order finite-difference scheme. Later increments add 2D acoustics, an inverse problem for \(c(x)\), and other geophysical operators (gravity, DC resistivity, Darcy flow, heat conduction).
+The first increment solves the **1D acoustic wave equation** forward in time and checks the network against d'Alembert's formula and a second-order finite-difference scheme. The second increment is the same forward problem on a rectangle, \(u_{tt} = c(x, z)^2 (u_{xx} + u_{zz}) + s\), checked against the analytic standing wave and a 2D finite-difference scheme. Later increments add an inverse problem for \(c(x, z)\) and other geophysical operators (gravity, DC resistivity, Darcy flow, heat conduction).
 
 ## Governing equation
 
@@ -81,7 +81,68 @@ The classical reference in `geopinn.reference.fdm` is the second-order leapfrog 
   = c^{2} \frac{u^n_{i+1} - 2 u^n_i + u^n_{i-1}}{\Delta x^{2}},
 \]
 
-started from the second-order Taylor step so that a prescribed initial velocity (zero in this problem) does not drop the global order. The same integrator accepts a 2D Cartesian Laplacian. The CFL ratio \(c \Delta t \sqrt{\sum_i \Delta x_i^{-2}}\) must be at most 1; `check_cfl` raises otherwise.
+started from the second-order Taylor step so that a prescribed initial velocity (zero in this problem) does not drop the global order. The CFL ratio \(c \Delta t \sqrt{\sum_i \Delta x_i^{-2}}\) must be at most 1 for the second-order stencil; `check_cfl` raises otherwise. The 2D scheme is the same integrator and is described below.
+
+## Two space dimensions
+
+The rectangle problem is
+
+\[
+u_{tt} = c(x, z)^{2} (u_{xx} + u_{zz}) + s,
+\qquad x \in [0, L_x],\; z \in [0, L_z],\; t \in [0, T],
+\]
+
+with homogeneous Dirichlet data on the boundary. This is the constant-density strong form. It is the same residual as in 1D: \(u_{tt} - c^{2}\nabla^{2}u - s\), and \(\nabla^{2}\) is summed over the columns of \(x\). In 2D those columns are \((x, z)\).
+
+Nondimensionalization keeps a single reference length \(L = L_x\),
+
+\[
+x = L x', \quad z = L z', \quad t = T t', \quad u = U u',
+\]
+
+so the training box is \(x' \in [0, 1]\), \(z' \in [0, L_z / L]\), \(t' \in [0, 1]\), and
+
+\[
+u'_{t't'} = \hat{c}(x', z')^{2} (u'_{x'x'} + u'_{z'z'}),
+\qquad \hat{c} = c\, T / L.
+\]
+
+A square domain is the unit cube. `problem.spatial_dim` defaults to 1, so the 1D configs are unchanged. `problem.depth` is \(L_z\).
+
+Soft constraints remain the default: the network output is the field. The hard option is available when the data are homogeneous Dirichlet and the initial velocity is zero. On the unit square the two forms are
+
+\[
+u = \sin(m\pi x)\sin(n\pi z)\,(1 + t^{2} N_\theta)
+\]
+
+and, for an initial displacement that already vanishes on the boundary,
+
+\[
+u = u_0(x, z) + t^{2}\, x(1 - x)\, z(1 - z)\, N_\theta.
+\]
+
+The Gaussian pulse used in the heterogeneous benchmark is multiplied by \(\sin(\pi x)\sin(\pi z)\) so that product is zero on the boundary. The four edges of the rectangle are sampled with `sample_boundary`; the interior and the initial slice take one extent per axis.
+
+`loss.causal: true` multiplies the PDE term by the causal weights of Wang, Sankaran, and Perdikaris (2022): time is split into bins and bin \(i\) is weighted by \(\exp(-\varepsilon \sum_{k<i} L_k)\), with the earlier losses detached. It runs during Adam only. L-BFGS minimizes the plain mean square, and the checkpoint keeps whichever of the two stages has the smaller plain loss. It is off unless the config asks for it.
+
+A coefficient is still a float, a tensor, or a callable. In 2D the callable receives \(x\) of shape `(N, 2)`. `coefficients.wave_speed.form: layered` builds a fixed smooth two-layer profile
+
+\[
+c(z) = \frac{c_{\mathrm{top}} + c_{\mathrm{bottom}}}{2}
+     + \frac{c_{\mathrm{bottom}} - c_{\mathrm{top}}}{2}
+       \tanh\frac{z - z_{\mathrm{int}}}{w}.
+\]
+
+`form: field` is still the named slot for a trainable \(c(x, z)\) or a Gassmann map, and the trainer still raises `CoefficientNotBuilt` until that builder exists. Passing the tensor or the callable into `AcousticWave` is unchanged, including backprop into a parameter speed.
+
+The 2D finite-difference scheme is second-order in time and second- or fourth-order in space (`spatial_order`). The fourth-order stencil is \((-1, 16, -30, 16, -1) / (12 h^{2})\) with the odd extension through a homogeneous Dirichlet boundary, which is exact for the sine modes. Its CFL limit on \(c \Delta t \sqrt{\sum 1/\Delta x_i^{2}}\) is \(\sqrt{3}/2\), from the Nyquist symbol \(16/(3 h^{2})\) and the leapfrog bound \(\omega \Delta t \le 2\). Heterogeneous \(c(x, z)\) is a float, an array, or a callable of the mesh; the step uses the fastest speed. `boundary="absorbing"` and `boundary="pml"` raise in `solve_wave_2d`. That is the hook for a sponge or a split PML.
+
+```bash
+geopinn-train --config configs/wave2d_standing_soft.yaml
+python benchmarks/wave2d_forward.py
+```
+
+`configs/wave2d_standing_hard.yaml` is the product-of-sines trial function. `configs/wave2d_layered.yaml` is the two-layer Gaussian pulse.
 
 ## Install
 
@@ -128,6 +189,20 @@ Both modes were trained on CPU from the checked-in configs (seed 0, float64). Sp
 
 The finite-difference reference is 3.22×10⁻⁶ from the analytic solution. Hard-mode boundary and initial residuals are at roundoff (boundary 1.2×10⁻¹⁶, both initial residuals 0). Soft-mode max absolute error is 1.69×10⁻³. The soft run needed the sine network and the longer L-BFGS polish; tanh on a shorter budget stayed near 4×10⁻³, and gradient-norm annealing was left off for the reason above. A rerun with the same seed on the same machine reproduces these figures; the last digits can move on different hardware.
 
+## Measured accuracy, 2D
+
+CPU, 4 cores, PyTorch 2.15 (no GPU), seed 0, float64. The standing wave is \(\sin(\pi x)\sin(\pi z)\cos(\pi\sqrt{2}\, t)\) on the unit cube. Relative \(L^2\) is over the space-time evaluation grid.
+
+| case | network and budget | reference | relative \(L^2\) | at \(t = T\) | time |
+| --- | --- | --- | --- | --- | --- |
+| hard (`configs/wave2d_standing_hard.yaml`) | 4×64 tanh, 4096 Sobol points, 1500 Adam + 200 L-BFGS | analytic | **3.96×10⁻⁴** | 1.72×10⁻³ | 71 s |
+| soft (`configs/wave2d_standing_soft.yaml`) | 5×64 sine, 8192 interior / 512 per edge / 1024 initial, weights 100, 2500 Adam + 500 L-BFGS | analytic | **8.58×10⁻³** | 5.42×10⁻² | 439 s |
+| layered (`configs/wave2d_layered.yaml`) | 5×64 sine, 8192 interior / 512 per edge / 2048 initial, IC weight 500, causal Adam \(\varepsilon = 1\), 2000 Adam + 400 L-BFGS | 4th-order FDM, 160² | **2.28×10⁻¹** | 3.00×10⁻¹ | 361 s |
+
+Hard mode clears \(10^{-3}\). The trial function already carries \(\sin(\pi x)\sin(\pi z)\), so the network only has to learn \((\cos\omega t - 1)/t^{2}\), and the boundary and initial residuals stay at roundoff. Soft mode does not clear \(10^{-3}\) on this budget. The snapshots match at \(t = 0\) and \(t = T/2\); the remaining error is concentrated at \(t = T\), which is why the final-time figure is larger than the space-time figure. Sine units are what move the loss: a tanh network with 32 Fourier features (\(\sigma = 1\)) was still at relative \(L^2 \approx 1\) after 800 Adam steps and 250 L-BFGS steps. Causal reweighting was left off for this single smooth mode. Collocation is fixed, as in 1D, so L-BFGS sees one function.
+
+The heterogeneous run uses \(c\) rising from 1.0 to 1.5 across \(z = 0.55\) with a tanh ramp of width 0.08, and a windowed Gaussian pulse. The fourth-order leapfrog reference on a 160² grid differs from the same scheme at half resolution by a Richardson estimate of about \(2 \times 10^{-5}\), so the \(0.23\) gap is the network. The snapshots follow the expanding front, including the sign change in the middle and the later distortion where the front crosses the fast layer. Relative \(L^2\) stays near \(0.23\) because a thin ring that is slightly shifted or weak lines up badly in an \(L^2\) inner product. Fourier features were tried and rejected: with \(\sigma = 2.5\) the initial velocity of a fresh network was huge, and the zero field (an exact solution when the source is zero) was an attractor. A hard polynomial trial function enforces the pulse exactly, but a plain tanh network did not learn the propagation on a short budget. The measured recipe is therefore soft sine units, a denser initial slice, and causal Adam with \(\varepsilon = 1\) (eight time bins) followed by plain L-BFGS. No collocation resampling: a fixed set is what makes the L-BFGS step meaningful, and the extra samples are spent on \(t = 0\), which is where the pulse is.
+
 ## Tests
 
 ```bash
@@ -141,10 +216,11 @@ What the tests lock in:
 - autograd second derivatives against a fourth-order finite-difference stencil, including the Cartesian Laplacian in 2D
 - PDE residual at roundoff on the exact standing wave, on a manufactured source, and on a 2D separated mode
 - the hard-constraint ansatz reproduces that exact field when \(N\) is the closed-form correction, and it matches Dirichlet data plus both initial conditions for sine and Gaussian data
-- soft-mode `pde`, `bc`, `ic_u`, and `ic_ut` are at roundoff when the network is replaced by the exact standing wave; Dirichlet and initial-velocity targets are the values supplied by the problem; boundary and initial samplers land on those sets
+- soft-mode `pde`, `bc`, `ic_u`, and `ic_ut` are at roundoff when the network is replaced by the exact standing wave, in 1D and on the 2D product mode; Dirichlet and initial-velocity targets are the values supplied by the problem; boundary and initial samplers land on those sets, including the four edges of a rectangle
 - both `constraints: hard` and `constraints: soft` parse, and omitting `constraints` defaults to soft
 - d'Alembert-with-images agrees with the standing wave
-- the 1D finite-difference scheme agrees with the analytic solution and converges at second order under grid refinement; the 2D stencil is the same order
+- the 1D finite-difference scheme agrees with the analytic solution and converges at second order under grid refinement
+- the 2D scheme converges at second order on \(\sin(m\pi x)\sin(n\pi z)\cos(\omega t)\) with a fixed CFL, the fourth-order stencil is fourth order on that mode, and a manufactured source with \(c = 1 + 0.4 z\) converges at second order; absorbing and PML boundaries raise
 - sampler shapes, bounds, and seed determinism
 - a two-step training run reloads from the checkpoint and repeats under the same seed
 
@@ -153,28 +229,32 @@ What the tests lock in:
 ## Layout
 
 ```
-configs/wave1d.yaml          hard-constraint benchmark
-configs/wave1d_soft.yaml     soft-constraint benchmark
-src/geopinn/nets/mlp.py      tanh / sine MLP, optional Fourier features
-src/geopinn/physics/         PDE interface, boundary targets, coefficients, acoustics
-src/geopinn/balance.py       optional Wang 2021 gradient-norm weights
-src/geopinn/sampling.py      interior, boundary, and initial collocation
-src/geopinn/losses.py        named weighted PDE + BC + IC + optional data
-src/geopinn/nondim.py        x/L, t/T, u/U
-src/geopinn/train.py         Adam then L-BFGS, CLI, checkpoints
-src/geopinn/reference/       d'Alembert solution and explicit FDM
+configs/wave1d.yaml              1D hard-constraint benchmark
+configs/wave1d_soft.yaml         1D soft-constraint benchmark
+configs/wave2d_standing_hard.yaml  2D product-of-sines trial function
+configs/wave2d_standing_soft.yaml  2D soft standing wave
+configs/wave2d_layered.yaml      2D two-layer Gaussian pulse
+src/geopinn/nets/mlp.py          tanh / sine MLP, optional Fourier features
+src/geopinn/physics/             PDE interface, coefficients, layered c(z)
+src/geopinn/balance.py           optional Wang 2021 gradient-norm weights
+src/geopinn/sampling.py          interior, boundary, and initial collocation
+src/geopinn/losses.py            named weighted loss, optional causal bins
+src/geopinn/nondim.py            x/L, z/L, t/T, u/U
+src/geopinn/train.py             Adam then L-BFGS, CLI, checkpoints
+src/geopinn/reference/           analytic modes and explicit FDM
 benchmarks/wave1d_dalembert.py
+benchmarks/wave2d_forward.py
 tests/
-notebooks/                   placeholder
+notebooks/                       placeholder
 ```
 
 ## Extension API
 
-The 1D benchmark is a constant \(c\). The interfaces underneath it are the ones a rock-physics module and a 2D inversion should plug into. Nothing in those interfaces assumes \(c\) is a Python float, that the network has a single output, or that the loss has a fixed list of arguments.
+The 1D benchmark is a constant \(c\), and the 2D benchmark adds a fixed layered profile. The interfaces underneath both are the ones a rock-physics module and an inversion should plug into. Nothing in those interfaces assumes \(c\) is a Python float, that the network has a single output, or that the loss has a fixed list of arguments.
 
-**Physics base class.** `PDE.residual_terms()` returns `ResidualTerm(name, where, evaluate)`. `evaluate(x, t, fields)` is the pointwise residual. `where` is the interior, the boundary, or the initial line. `AcousticWave` emits `pde`, `bc`, `ic_u`, and `ic_ut`. The scalar unknown is the field named `u`. Boundary and initial targets are coefficients supplied with the problem, not constants inside the residual. `BoundaryKind` is `dirichlet`, `neumann`, or `absorbing`; only Dirichlet (`u - g`) is implemented, and the other two raise in `_boundary_residual` where their formulas belong. A coefficient is a float, a tensor (gradients included), or a callable. A one-argument callable receives \(x\); a two-argument callable receives \((x, t)\). That callable is where a Gassmann-type map or a trainable \(c(x)\) will sit. For a constant float the PDE residual is still the plain multiply \(u_{tt} - c^2\nabla^2 u\). For a spatially varying \(c\) the same line is the constant-density strong form; the divergence form \(\nabla\cdot(c^2\nabla u)\) agrees with it when \(c\) is constant.
+**Physics base class.** `PDE.residual_terms()` returns `ResidualTerm(name, where, evaluate)`. `evaluate(x, t, fields)` is the pointwise residual. `where` is the interior, the boundary, or the initial line. `AcousticWave` emits `pde`, `bc`, `ic_u`, and `ic_ut`. The scalar unknown is the field named `u`. Boundary and initial targets are coefficients supplied with the problem, not constants inside the residual. `BoundaryKind` is `dirichlet`, `neumann`, or `absorbing`; only Dirichlet (`u - g`) is implemented, and the other two raise in `_boundary_residual` where their formulas belong. A coefficient is a float, a tensor (gradients included), or a callable. A one-argument callable receives the spatial batch \(x\): shape `(N, 1)` in 1D, and `(N, 2)` with columns `(x, z)` in 2D. A two-argument callable receives `(x, t)`. That callable is where a Gassmann-type map or a trainable \(c(x, z)\) will sit. For a constant float the PDE residual is still the plain multiply \(u_{tt} - c^2\nabla^2 u\). For a spatially varying \(c\) the same line is the constant-density strong form \(u_{tt} - c(x, z)^2(u_{xx} + u_{zz})\); the divergence form \(\nabla\cdot(c^2\nabla u)\) agrees with it when \(c\) is constant.
 
-**Loss composition.** `pinn_loss` groups terms that share a collocation site, runs one forward pass per site, and adds \(w_k\|R_k\|^2\). In soft mode that is \(w_{\mathrm{pde}} L_{\mathrm{pde}} + w_{\mathrm{bc}} L_{\mathrm{bc}} + w_{\mathrm{ic\_u}} L_{\mathrm{ic\_u}} + w_{\mathrm{ic\_ut}} L_{\mathrm{ic\_ut}}\), with \(u_t\) from autograd and the batches coming from the boundary and initial samplers. Observations are an extra mapping of name to `(prediction, target)`, so `data_vp` is the same mechanism as `data`. A missing weight is 0. Hard mode zeros `bc`, `ic_u`, and `ic_ut` in the trainer because the trial function already satisfies them; the YAML values stay as the soft-constraint weights. `loss.balance: wang2021` optionally replaces those non-PDE weights by gradient-norm ratios. It is off unless requested.
+**Loss composition.** `pinn_loss` groups terms that share a collocation site, runs one forward pass per site, and adds \(w_k\|R_k\|^2\). In soft mode that is \(w_{\mathrm{pde}} L_{\mathrm{pde}} + w_{\mathrm{bc}} L_{\mathrm{bc}} + w_{\mathrm{ic\_u}} L_{\mathrm{ic\_u}} + w_{\mathrm{ic\_ut}} L_{\mathrm{ic\_ut}}\), with \(u_t\) from autograd and the batches coming from the boundary and initial samplers. The same four names are used in 2D; only the shape of \(x\) changes. Observations are an extra mapping of name to `(prediction, target)`, so `data_vp` is the same mechanism as `data`. A missing weight is 0. Hard mode zeros `bc`, `ic_u`, and `ic_ut` in the trainer because the trial function already satisfies them; the YAML values stay as the soft-constraint weights. `loss.balance: wang2021` optionally replaces those non-PDE weights by gradient-norm ratios. `loss.causal: true` optionally reweights the PDE bins in time during Adam. Both are off unless requested.
 
 **Config schema.** `TrainConfig` is a frozen dataclass and `TrainConfig.from_dict` is what the YAML loader fills. Top-level `constraints` is `soft` (the default if omitted) or `hard`. `constraint_form` is `none` for soft and `modal_sine` or `polynomial` for hard. The other blocks are `problem`, `coefficients`, `network`, `sampling`, `loss`, and `optim`.
 
@@ -182,15 +262,18 @@ The 1D benchmark is a constant \(c\). The interfaces underneath it are the ones 
 constraints: soft             # hard | soft; omitted means soft
 constraint_form: none         # modal_sine or polynomial only when hard
 problem:
+  spatial_dim: 1              # 2 uses columns (x, z); depth is Lz
   boundary: dirichlet         # neumann and absorbing are named, not implemented
   dirichlet_value: 0.0        # g in u - g
   ic: sine                    # u0; gaussian is the other built-in profile
   initial_velocity: 0.0       # v0
+  # mode_x, mode_z, depth, gaussian_center_z, gaussian_width_z: 2D only
 coefficients:
   wave_speed:
     form: constant            # problem.wave_speed, then c*T/L
+    # form: layered           # fixed smooth c(z); c_top, c_bottom, interface, transition
     # form: field             # not built yet
-    # source: c_of_rock       # trainable c(x) or a rock-physics map
+    # source: c_of_rock       # trainable c(x, z) or a rock-physics map
 network:
   field_names: [u]            # later: [u, porosity, saturation]
 loss:
@@ -205,15 +288,18 @@ loss:
   balance: none               # or wang2021
   balance_alpha: 0.9
   balance_every: 10
+  causal: false               # Adam-only time bins; L-BFGS stays a plain mean square
+  causal_epsilon: 1.0
+  causal_bins: 16
 ```
 
-`form: field` parses and names its `source`, and the trainer raises `CoefficientNotBuilt` until a builder exists. Passing the tensor or callable into `AcousticWave(wave_speed=...)` already works, including backprop into a parameter speed.
+`form: field` parses and names its `source`, and the trainer raises `CoefficientNotBuilt` until a builder exists. `form: layered` is a fixed profile, not that slot. Passing the tensor or callable into `AcousticWave(wave_speed=...)` already works in 1D and in 2D, including backprop into a parameter speed. The finite-difference solver accepts the same kinds of speed (float, array, or callable of the mesh) and leaves `boundary="absorbing"` and `boundary="pml"` as the lateral-update hook.
 
 ## Roadmap
 
-1. **2D acoustic forward problem** on a rectangle, same hard or soft constraints, verified against the 2D leapfrog scheme already in `reference/fdm.py`.
-2. **Inverse problem for \(c(x)\)**: add the wave speed as an unknown field, a data term on seismograms or on \(u\), and a check against a manufactured \(c(x)\).
-3. **Other physics**, each as a new `PDE` with the same residual / boundary / initial interface and the same nondimensional scaling: gravity, DC resistivity, Darcy pressure diffusion, and heat conduction.
+1. **2D acoustic forward problem.** Done in this increment: rectangle, hard or soft constraints, heterogeneous \(c(x, z)\), verified against the 2D leapfrog scheme.
+2. **Inverse problem for \(c(x, z)\)**: build `form: field` as a trainable speed or a Gassmann map from porosity and saturation, add a data term on seismograms or on \(u\), and check it against a manufactured \(c(x, z)\). The residual already evaluates a tensor or a callable speed.
+3. **Other physics**, each as a new `PDE` with the same residual / boundary / initial interface and the same nondimensional scaling: gravity, DC resistivity, Darcy pressure diffusion, and heat conduction. Absorbing boundaries and a PML stay on the hooks in `AcousticWave._boundary_residual` and `solve_wave_2d(boundary=...)`.
 
 ## References
 
@@ -222,3 +308,4 @@ loss:
 - Raissi, Perdikaris, Karniadakis, "Physics-informed neural networks" (2019), for the strong-form residual loss.
 - Sitzmann et al., "Implicit neural representations with periodic activation functions" (2020), for the sine-network initialisation.
 - Wang, Teng, Perdikaris, "Understanding and mitigating gradient flow pathologies in physics-informed neural networks" (2021), for the optional loss-term weights.
+- Wang, Sankaran, Perdikaris, "Respecting causality is all you need for training physics-informed neural networks" (2022), for the optional time-binned PDE weights.

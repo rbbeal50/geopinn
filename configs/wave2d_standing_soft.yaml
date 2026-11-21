@@ -1,0 +1,67 @@
+# 2D acoustic standing wave, soft constraints (the default).
+# Already nondimensional: x, z, t in [0, 1], c = 1, so c*T/L = 1.
+#   u_tt = c^2 (u_xx + u_zz)
+#   u = 0 on the boundary of the unit square
+#   u(x, z, 0) = sin(pi x) sin(pi z),  u_t = 0
+#   u = sin(pi x) sin(pi z) cos(pi c sqrt(2) t)
+# Sine units are what cleared 1e-3 on the 1D soft standing wave.
+seed: 0
+device: cpu
+log_every: 200
+checkpoint: outputs/checkpoints/wave2d_standing_soft.pt
+constraints: soft
+
+problem:
+  spatial_dim: 2
+  length: 1.0
+  depth: 1.0
+  time_final: 1.0
+  wave_speed: 1.0
+  amplitude: 1.0
+  boundary: dirichlet
+  dirichlet_value: 0.0
+  ic: sine
+  mode_x: 1
+  mode_z: 1
+  initial_velocity: 0.0
+  gaussian_center: 0.5
+  gaussian_width: 0.12
+
+coefficients:
+  wave_speed:
+    form: constant
+
+network:
+  field_names: [u]
+  hidden_layers: 5
+  hidden_dim: 64
+  activation: sin
+  sine_omega: 1.0
+  fourier_features: 0
+  fourier_sigma: 1.0
+
+sampling:
+  n_interior: 8192
+  n_boundary_per_side: 512
+  n_initial: 1024
+  method: sobol
+
+loss:
+  weights:
+    pde: 1.0
+    bc: 100.0
+    ic_u: 100.0
+    ic_ut: 100.0
+    data: 0.0
+  balance: none
+  causal: false
+
+optim:
+  adam_steps: 2500
+  adam_lr: 0.001
+  adam_lr_gamma: 0.1
+  adam_lr_step_frac: 0.6
+  lbfgs_steps: 500
+  lbfgs_lr: 1.0
+  lbfgs_history: 50
+  lbfgs_line_search_evals: 20

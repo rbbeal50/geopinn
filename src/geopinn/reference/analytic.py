@@ -55,6 +55,73 @@ def gaussian_profile(
     return profile
 
 
+def standing_wave_2d(
+    x: ArrayLike,
+    z: ArrayLike,
+    t: ArrayLike,
+    *,
+    wave_speed: float,
+    length_x: float = 1.0,
+    length_z: float = 1.0,
+    amplitude: float = 1.0,
+    mode_x: int = 1,
+    mode_z: int = 1,
+) -> np.ndarray:
+    """Separated solution of the homogeneous 2D wave equation.
+
+    .. math::
+
+        u(x, z, t) = A \\sin(m \\pi x / L_x) \\sin(n \\pi z / L_z) \\cos(\\omega t)
+
+        \\omega = \\pi c \\sqrt{(m / L_x)^2 + (n / L_z)^2}
+
+    satisfies ``u_tt = c² (u_xx + u_zz)`` with homogeneous Dirichlet data on the
+    rectangle, ``u(x, z, 0)`` equal to the product of sines, and ``u_t = 0`` at
+    ``t = 0``. ``x``, ``z``, and ``t`` must broadcast.
+    """
+    if mode_x < 1 or mode_z < 1 or length_x <= 0.0 or length_z <= 0.0 or wave_speed < 0.0:
+        raise ValueError("modes and lengths must be positive and wave_speed non-negative")
+    x_arr = np.asarray(x, dtype=np.float64)
+    z_arr = np.asarray(z, dtype=np.float64)
+    t_arr = np.asarray(t, dtype=np.float64)
+    kx = mode_x * math.pi / length_x
+    kz = mode_z * math.pi / length_z
+    omega = wave_speed * math.sqrt(kx * kx + kz * kz)
+    return amplitude * np.sin(kx * x_arr) * np.sin(kz * z_arr) * np.cos(omega * t_arr)
+
+
+def gaussian_pulse_2d(
+    x: ArrayLike,
+    z: ArrayLike,
+    *,
+    center_x: float,
+    center_z: float,
+    width_x: float,
+    width_z: float,
+    length_x: float = 1.0,
+    length_z: float = 1.0,
+    amplitude: float = 1.0,
+) -> np.ndarray:
+    """Smooth Gaussian bump forced to zero on the boundary of the rectangle.
+
+    The sine window is 1 in the interior and 0 on ``x = 0, Lx`` and
+    ``z = 0, Lz``, so the product is a homogeneous-Dirichlet initial
+    displacement. It matches :func:`geopinn.initial.gaussian_2d_torch`.
+    """
+    if min(width_x, width_z, length_x, length_z) <= 0.0:
+        raise ValueError("widths and lengths must be positive")
+    x_arr = np.asarray(x, dtype=np.float64)
+    z_arr = np.asarray(z, dtype=np.float64)
+    raw = np.exp(
+        -(
+            (x_arr - center_x) ** 2 / (2.0 * width_x**2)
+            + (z_arr - center_z) ** 2 / (2.0 * width_z**2)
+        )
+    )
+    window = np.sin(math.pi * x_arr / length_x) * np.sin(math.pi * z_arr / length_z)
+    return cast(np.ndarray, amplitude * raw * window)
+
+
 def standing_wave_1d(
     x: ArrayLike,
     t: ArrayLike,
