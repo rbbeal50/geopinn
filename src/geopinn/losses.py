@@ -6,7 +6,7 @@ YAML map ``loss.weights`` selects the pieces by name:
     L = sum_k  w_k ‖R_k‖²
 
 Names are not fixed by this module. The acoustic equation emits ``residual``,
-``bc``, ``ic``, and ``ic_velocity``. Observations passed in by the caller use
+``bc``, ``ic_u``, and ``ic_ut``. Observations passed in by the caller use
 whatever names they were given (``data``, later ``data_vp``, and so on). A
 weight whose name is not emitted is ignored, so a config can mention a term
 that a future physics module will produce. A missing weight defaults to 0,

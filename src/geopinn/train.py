@@ -15,12 +15,14 @@ import torch
 from torch import Tensor, nn
 
 from geopinn.ansatz import HardConstraintWave1D, UnconstrainedField
+from geopinn.balance import wang2021_weights
 from geopinn.config import TrainConfig, load_config
 from geopinn.initial import displacement_torch
 from geopinn.losses import LossTerms, pinn_loss
 from geopinn.nets.mlp import MLP
 from geopinn.nondim import Scales, warn_if_poorly_scaled
 from geopinn.physics.acoustic import AcousticWave
+from geopinn.physics.boundary import BoundaryCondition, BoundaryKind
 from geopinn.physics.coefficients import resolve_wave_speed
 from geopinn.sampling import PointBatch, sample_boundary_1d, sample_initial, sample_interior
 from geopinn.seed import set_seed
@@ -32,10 +34,10 @@ class HistoryRow(TypedDict):
     step: int
     stage: str
     loss: float
-    residual: float
+    pde: float
     bc: float | None
-    ic: float | None
-    ic_velocity: float | None
+    ic_u: float | None
+    ic_ut: float | None
 
 
 class TrainingError(RuntimeError):
@@ -52,6 +54,7 @@ class TrainResult:
     config: TrainConfig
     seconds: float
     checkpoint_path: Path | None
+    loss_weights: dict[str, float]
 
 
 def scales_from_config(config: TrainConfig) -> Scales:
@@ -79,9 +82,9 @@ def build_trial(config: TrainConfig) -> nn.Module:
         map_unit_interval=network.fourier_features == 0,
         seed=config.seed,
     )
-    if not config.loss.hard_constraints:
+    if config.constraints == "soft":
         return UnconstrainedField(net)
-    if config.loss.constraint_form == "modal_sine":
+    if config.constraint_form == "modal_sine":
         return HardConstraintWave1D(net, form="modal_sine")
     return HardConstraintWave1D(
         net,
@@ -214,11 +217,16 @@ def _train_with_dtype(config: TrainConfig, *, verbose: bool) -> TrainResult:
     model = build_trial(config).to(device)
     pde = AcousticWave(
         wave_speed=resolve_wave_speed(config.coefficients.wave_speed, scales.c_hat),
+        boundary=BoundaryCondition(
+            BoundaryKind(config.problem.boundary),
+            config.problem.dirichlet_value,
+        ),
         initial_displacement=hat_displacement(config),
-        initial_velocity=lambda x: torch.zeros_like(x),
+        initial_velocity=config.problem.initial_velocity,
     )
     interior, boundary, initial = _collocation(config, device)
-    weights = _weights(config)
+    active_weights = _weights(config)
+    running_weights: dict[str, float] = dict(active_weights)
     history: list[HistoryRow] = []
     best_loss = math.inf
     best_state: dict[str, Tensor] | None = None
@@ -230,7 +238,7 @@ def _train_with_dtype(config: TrainConfig, *, verbose: bool) -> TrainResult:
             interior,
             boundary,
             initial,
-            weights,
+            active_weights,
             monitor_constraints=monitor,
             field_names=config.network.field_names,
         )
@@ -248,7 +256,16 @@ def _train_with_dtype(config: TrainConfig, *, verbose: bool) -> TrainResult:
         return value
 
     if config.optim.adam_steps > 0:
-        _run_adam(config, model, objective, consider, history, verbose)
+        _run_adam(
+            config,
+            model,
+            objective,
+            consider,
+            history,
+            verbose,
+            active_weights,
+            running_weights,
+        )
         # Score the weights produced by the last Adam update, not only the
         # pre-update state recorded inside the loop.
         consider(objective(monitor=False))
@@ -266,6 +283,7 @@ def _train_with_dtype(config: TrainConfig, *, verbose: bool) -> TrainResult:
         config=config,
         seconds=0.0,
         checkpoint_path=checkpoint_path,
+        loss_weights=dict(active_weights),
     )
 
 
@@ -276,6 +294,8 @@ def _run_adam(
     consider: Callable[[LossTerms], float],
     history: list[HistoryRow],
     verbose: bool,
+    active_weights: dict[str, float],
+    running_weights: dict[str, float],
 ) -> None:
     optim = config.optim
     optimizer = torch.optim.Adam(model.parameters(), lr=optim.adam_lr)
@@ -291,6 +311,18 @@ def _run_adam(
         optimizer.zero_grad(set_to_none=True)
         terms = objective(monitor=monitor)
         consider(terms)
+        if config.loss.balance == "wang2021" and step % config.loss.balance_every == 0:
+            # Update multipliers for the next step. This step's total loss
+            # already used the previous multipliers.
+            annealed = wang2021_weights(
+                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                terms.terms,
+                _weights(config),
+                running_weights,
+                alpha=config.loss.balance_alpha,
+            )
+            active_weights.clear()
+            active_weights.update(annealed)
         _backward(terms.total)
         optimizer.step()
         scheduler.step()
@@ -388,10 +420,10 @@ def _collocation(
 
 def _weights(config: TrainConfig) -> dict[str, float]:
     weights = dict(config.loss.weights)
-    if config.loss.hard_constraints:
+    if config.constraints == "hard":
         # The trial function already satisfies these, so they must not compete
         # with the PDE residual. They are still evaluated on log steps.
-        for name in ("bc", "ic", "ic_velocity"):
+        for name in ("bc", "ic_u", "ic_ut"):
             weights[name] = 0.0
     return weights
 
@@ -408,15 +440,15 @@ def _row(stage: str, step: int, terms: LossTerms, *, monitored: bool) -> History
             return None
         return float(value.detach())
 
-    residual = terms.get("residual")
+    pde = terms.get("pde")
     return HistoryRow(
         step=step,
         stage=stage,
         loss=float(terms.total.detach()),
-        residual=0.0 if residual is None else float(residual.detach()),
+        pde=0.0 if pde is None else float(pde.detach()),
         bc=_piece("bc"),
-        ic=_piece("ic"),
-        ic_velocity=_piece("ic_velocity"),
+        ic_u=_piece("ic_u"),
+        ic_ut=_piece("ic_ut"),
     )
 
 
@@ -424,14 +456,14 @@ def _print_row(verbose: bool, row: HistoryRow) -> None:
     if not verbose:
         return
     bc = row["bc"]
-    ic = row["ic"]
-    velocity = row["ic_velocity"]
+    ic_u = row["ic_u"]
+    ic_ut = row["ic_ut"]
     bc_text = "n/a" if bc is None else f"{bc:.3e}"
-    ic_text = "n/a" if ic is None else f"{ic:.3e}"
-    velocity_text = "n/a" if velocity is None else f"{velocity:.3e}"
+    ic_text = "n/a" if ic_u is None else f"{ic_u:.3e}"
+    velocity_text = "n/a" if ic_ut is None else f"{ic_ut:.3e}"
     print(
         f"{row['stage']:5s} step {row['step']:5d}  loss {row['loss']:.3e}  "
-        f"residual {row['residual']:.3e}  bc {bc_text}  ic {ic_text}  ic_t {velocity_text}",
+        f"pde {row['pde']:.3e}  bc {bc_text}  ic_u {ic_text}  ic_ut {velocity_text}",
         flush=True,
     )
 

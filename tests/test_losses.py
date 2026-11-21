@@ -20,10 +20,10 @@ from geopinn.sampling import PointBatch
 class _FakePDE(PDE):
     def residual_terms(self) -> tuple[ResidualTerm, ...]:
         return (
-            ResidualTerm("residual", Site.INTERIOR, _ones(1.0)),
+            ResidualTerm("pde", Site.INTERIOR, _ones(1.0)),
             ResidualTerm("bc", Site.BOUNDARY, _ones(2.0)),
-            ResidualTerm("ic", Site.INITIAL, _ones(3.0)),
-            ResidualTerm("ic_velocity", Site.INITIAL, _ones(4.0)),
+            ResidualTerm("ic_u", Site.INITIAL, _ones(3.0)),
+            ResidualTerm("ic_ut", Site.INITIAL, _ones(4.0)),
         )
 
 
@@ -43,10 +43,10 @@ def _batch(n: int, value: float) -> PointBatch:
 
 def test_weights_and_named_observations_add_as_mean_squares() -> None:
     weights = {
-        "residual": 1.0,
+        "pde": 1.0,
         "bc": 10.0,
-        "ic": 100.0,
-        "ic_velocity": 1000.0,
+        "ic_u": 100.0,
+        "ic_ut": 1000.0,
         "data": 0.5,
         "data_vp": 2.0,
         # A name nothing emits is ignored, so a future term can sit in the YAML.
@@ -67,7 +67,7 @@ def test_weights_and_named_observations_add_as_mean_squares() -> None:
     # mse(1) = 1, mse(2) = 4, mse(3) = 9, mse(4) = 16, mse(3) = 9, mse(1) = 1.
     expected = 1.0 * 1.0 + 10.0 * 4.0 + 100.0 * 9.0 + 1000.0 * 16.0 + 0.5 * 9.0 + 2.0 * 1.0
     assert torch.allclose(terms.total, torch.tensor(expected))
-    residual = terms.get("residual")
+    residual = terms.get("pde")
     data = terms.get("data")
     assert residual is not None and data is not None
     assert torch.allclose(residual, torch.tensor(1.0))

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from geopinn.physics.base import PDE, ResidualTerm, Site
+from geopinn.physics.boundary import BoundaryCondition, BoundaryKind
 from geopinn.physics.coefficients import CoeffLike, evaluate_coefficient
 from geopinn.physics.differentiate import laplacian, partial, second_partial
 from geopinn.physics.fields import Fields, coerce_fields
@@ -18,7 +19,7 @@ PredictFn = Callable[[Tensor, Tensor], Tensor | Fields]
 class AcousticWave(PDE):
     """Acoustic wave equation with a coefficient wave speed.
 
-    The strong form encoded by the ``residual`` term is
+    The strong form encoded by the ``pde`` term is
 
         u_tt - c(x, t)² ∇²u - s = 0.
 
@@ -37,9 +38,15 @@ class AcousticWave(PDE):
     named fields in the same batch are ignored, so a multi-output network can
     carry auxiliary parameters beside the wavefield.
 
-    Dirichlet data default to ``g = 0``. Initial data default to a medium at
-    rest (``u0 = 0``, ``v0 = 0``). Those data are coefficients too, so they
-    may be callables or tensors.
+    The boundary target comes from ``boundary``. Dirichlet is
+    ``u - g(x, t)``. Neumann (outward ``u_n - h``) and absorbing
+    (outgoing characteristic) are selected by ``BoundaryKind`` and raised as
+    not-implemented until those residuals are filled in. Initial targets
+    ``u0`` and ``v0`` are coefficients supplied by the problem. Nothing here
+    assumes the initial displacement is ``sin(π x)``.
+
+    Omitted boundary data mean homogeneous Dirichlet. Omitted initial data
+    mean a medium at rest.
     """
 
     def __init__(
@@ -47,7 +54,7 @@ class AcousticWave(PDE):
         wave_speed: CoeffLike,
         *,
         source: CoeffLike | None = None,
-        dirichlet: CoeffLike | None = None,
+        boundary: BoundaryCondition | None = None,
         initial_displacement: CoeffLike | None = None,
         initial_velocity: CoeffLike | None = None,
     ) -> None:
@@ -57,16 +64,20 @@ class AcousticWave(PDE):
             raise ValueError("a constant wave_speed must be positive")
         self.wave_speed = wave_speed
         self.source = source
-        self.dirichlet = dirichlet
+        self.boundary = (
+            boundary if boundary is not None else BoundaryCondition(BoundaryKind.DIRICHLET, 0.0)
+        )
         self.initial_displacement = initial_displacement
         self.initial_velocity = initial_velocity
 
     def residual_terms(self) -> tuple[ResidualTerm, ...]:
+        # Names match the soft-constraint loss:
+        #   w_pde L_pde + w_bc L_bc + w_ic_u L_ic_u + w_ic_ut L_ic_ut.
         return (
-            ResidualTerm("residual", Site.INTERIOR, self._pde_residual),
+            ResidualTerm("pde", Site.INTERIOR, self._pde_residual),
             ResidualTerm("bc", Site.BOUNDARY, self._boundary_residual),
-            ResidualTerm("ic", Site.INITIAL, self._displacement_residual),
-            ResidualTerm("ic_velocity", Site.INITIAL, self._velocity_residual),
+            ResidualTerm("ic_u", Site.INITIAL, self._displacement_residual),
+            ResidualTerm("ic_ut", Site.INITIAL, self._velocity_residual),
         )
 
     def residual(self, x: Tensor, t: Tensor, predict: PredictFn) -> Tensor:
@@ -74,7 +85,7 @@ class AcousticWave(PDE):
         return self._pde_residual(x, t, _as_fields(predict, x, t))
 
     def bc(self, x: Tensor, t: Tensor, predict: PredictFn) -> Tensor:
-        """Dirichlet residual ``u - g``, shape ``(N, 1)``."""
+        """Boundary residual, shape ``(N, 1)``. Dirichlet is ``u - g``."""
         return self._boundary_residual(x, t, _as_fields(predict, x, t))
 
     def ic(self, x: Tensor, t: Tensor, predict: PredictFn) -> tuple[Tensor, Tensor]:
@@ -97,10 +108,23 @@ class AcousticWave(PDE):
         return u_tt - speed**2 * lap - source
 
     def _boundary_residual(self, x: Tensor, t: Tensor, fields: Fields) -> Tensor:
-        # Dirichlet residual u - g. Both ends of the 1D interval use g = 0.
         field = fields["u"]
-        prescribed = _zero_or(self.dirichlet, field, x, t)
-        return field - prescribed
+        kind = self.boundary.kind
+        if kind is BoundaryKind.DIRICHLET:
+            # u - g(x, t) = 0. g is the problem's Dirichlet target.
+            target = evaluate_coefficient(self.boundary.value, x, t)
+            return field - target
+        if kind is BoundaryKind.NEUMANN:
+            raise NotImplementedError(
+                "Neumann residual is the outward normal derivative minus the "
+                "supplied flux, evaluated in AcousticWave._boundary_residual. "
+                "Only Dirichlet is implemented."
+            )
+        raise NotImplementedError(
+            "Absorbing residual is the outgoing characteristic "
+            "(u_t + c u_n on a right-going end), evaluated in "
+            "AcousticWave._boundary_residual. Only Dirichlet is implemented."
+        )
 
     def _displacement_residual(self, x: Tensor, t: Tensor, fields: Fields) -> Tensor:
         # u(x, 0) - u0(x) = 0.

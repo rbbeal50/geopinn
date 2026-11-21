@@ -11,8 +11,11 @@ import yaml
 ICName = Literal["sine", "gaussian"]
 ActivationName = Literal["tanh", "sin"]
 SamplerName = Literal["lhs", "sobol"]
+ConstraintMode = Literal["soft", "hard"]
 ConstraintForm = Literal["modal_sine", "polynomial", "none"]
 CoefficientForm = Literal["constant", "field"]
+BoundaryName = Literal["dirichlet", "neumann", "absorbing"]
+BalanceMode = Literal["none", "wang2021"]
 
 
 class ConfigError(ValueError):
@@ -21,11 +24,23 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ProblemConfig:
+    """The IBVP the trainer hands to the PDE.
+
+    ``boundary`` selects the trace. ``dirichlet_value`` is the Dirichlet
+    target ``g`` (a constant in this schema; a field target is a coefficient
+    passed to ``AcousticWave`` in Python). ``ic`` selects the initial
+    displacement profile. ``initial_velocity`` is ``v0``. Neither profile is
+    hard-coded inside the residual.
+    """
+
     length: float
     time_final: float
     wave_speed: float
     amplitude: float
+    boundary: BoundaryName
+    dirichlet_value: float
     ic: ICName
+    initial_velocity: float
     gaussian_center: float
     gaussian_width: float
 
@@ -80,16 +95,24 @@ class CoefficientConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    """Named weights plus the hard-constraint switch.
+    """Named weights and optional gradient-norm balancing.
 
     ``weights`` maps a residual or observation name to a non-negative
-    multiplier. Names the active PDE does not emit are kept, so the file can
-    already list ``data_vp`` or ``regularization_c`` for a later module.
+    multiplier. The acoustic names are ``pde``, ``bc``, ``ic_u``, and
+    ``ic_ut``. Names the active PDE does not emit are kept, so the file can
+    already list ``data_vp`` or ``regularization_c``.
+
+    ``balance`` is ``none`` or ``wang2021``. The latter is the learning-rate
+    annealing of Wang, Teng, and Perdikaris (2021): each non-PDE weight tracks
+    the ratio of gradient magnitudes. It is off by default. ``balance_alpha``
+    is the paper's mixing rate and ``balance_every`` is how many Adam steps
+    pass between updates.
     """
 
     weights: dict[str, float]
-    hard_constraints: bool
-    constraint_form: ConstraintForm
+    balance: BalanceMode = "none"
+    balance_alpha: float = 0.9
+    balance_every: int = 10
 
 
 @dataclass(frozen=True)
@@ -110,6 +133,8 @@ class TrainConfig:
     device: str
     log_every: int
     checkpoint: str
+    constraints: ConstraintMode
+    constraint_form: ConstraintForm
     problem: ProblemConfig
     coefficients: CoefficientConfig
     network: NetworkConfig
@@ -129,6 +154,8 @@ class TrainConfig:
                 "device",
                 "log_every",
                 "checkpoint",
+                "constraints",
+                "constraint_form",
                 "problem",
                 "coefficients",
                 "network",
@@ -137,6 +164,20 @@ class TrainConfig:
                 "optim",
             },
             "config",
+            optional={"constraints", "constraint_form"},
+        )
+        constraints = cast(
+            ConstraintMode,
+            _optional_choice(data, "constraints", ("soft", "hard"), default="soft"),
+        )
+        constraint_form = cast(
+            ConstraintForm,
+            _optional_choice(
+                data,
+                "constraint_form",
+                ("modal_sine", "polynomial", "none"),
+                default="none",
+            ),
         )
         problem = _problem(_section(data, "problem"))
         coefficients = _coefficients(_section(data, "coefficients"))
@@ -144,12 +185,23 @@ class TrainConfig:
         sampling = _sampling(_section(data, "sampling"))
         loss = _loss(_section(data, "loss"))
         optim = _optim(_section(data, "optim"))
-        _validate_consistency(problem, coefficients, network, loss, sampling, optim)
+        _validate_consistency(
+            constraints,
+            constraint_form,
+            problem,
+            coefficients,
+            network,
+            loss,
+            sampling,
+            optim,
+        )
         return TrainConfig(
             seed=_req_int(data, "seed", minimum=0),
             device=_req_str(data, "device"),
             log_every=_req_int(data, "log_every", minimum=1),
             checkpoint=_req_str(data, "checkpoint"),
+            constraints=constraints,
+            constraint_form=constraint_form,
             problem=problem,
             coefficients=coefficients,
             network=network,
@@ -176,19 +228,26 @@ def _problem(data: dict[str, Any]) -> ProblemConfig:
             "time_final",
             "wave_speed",
             "amplitude",
+            "boundary",
+            "dirichlet_value",
             "ic",
+            "initial_velocity",
             "gaussian_center",
             "gaussian_width",
         },
         "problem",
     )
     ic = _req_choice(data, "ic", ("sine", "gaussian"))
+    boundary = _req_choice(data, "boundary", ("dirichlet", "neumann", "absorbing"))
     return ProblemConfig(
         length=_req_float(data, "length", positive=True),
         time_final=_req_float(data, "time_final", positive=True),
         wave_speed=_req_float(data, "wave_speed", positive=True),
         amplitude=_req_float(data, "amplitude", positive=True),
+        boundary=cast(BoundaryName, boundary),
+        dirichlet_value=_req_float(data, "dirichlet_value"),
         ic=cast(ICName, ic),
+        initial_velocity=_req_float(data, "initial_velocity"),
         gaussian_center=_req_float(data, "gaussian_center"),
         gaussian_width=_req_float(data, "gaussian_width", positive=True),
     )
@@ -254,14 +313,21 @@ def _sampling(data: dict[str, Any]) -> SamplingConfig:
 def _loss(data: dict[str, Any]) -> LossConfig:
     _check_keys(
         data,
-        {"weights", "hard_constraints", "constraint_form"},
+        {"weights", "balance", "balance_alpha", "balance_every"},
         "loss",
+        optional={"balance", "balance_alpha", "balance_every"},
     )
-    form = _req_choice(data, "constraint_form", ("modal_sine", "polynomial", "none"))
+    balance = cast(
+        BalanceMode,
+        _optional_choice(data, "balance", ("none", "wang2021"), default="none"),
+    )
+    alpha = _optional_float(data, "balance_alpha", default=0.9)
+    every = _optional_int(data, "balance_every", default=10)
     return LossConfig(
         weights=_req_weights(data, "weights"),
-        hard_constraints=_req_bool(data, "hard_constraints"),
-        constraint_form=cast(ConstraintForm, form),
+        balance=balance,
+        balance_alpha=alpha,
+        balance_every=every,
     )
 
 
@@ -293,6 +359,8 @@ def _optim(data: dict[str, Any]) -> OptimConfig:
 
 
 def _validate_consistency(
+    constraints: ConstraintMode,
+    constraint_form: ConstraintForm,
     problem: ProblemConfig,
     coefficients: CoefficientConfig,
     network: NetworkConfig,
@@ -304,16 +372,35 @@ def _validate_consistency(
         raise ConfigError("problem.wave_speed must be positive")
     if not 0.0 < optim.adam_lr_step_frac <= 1.0:
         raise ConfigError("optim.adam_lr_step_frac must lie in (0, 1]")
-    if "residual" not in loss.weights:
-        raise ConfigError("loss.weights must include residual")
-    if loss.hard_constraints and loss.constraint_form == "none":
-        raise ConfigError("hard_constraints requires constraint_form modal_sine or polynomial")
-    if not loss.hard_constraints and loss.constraint_form != "none":
-        raise ConfigError("constraint_form must be 'none' when hard_constraints is false")
-    if loss.constraint_form == "modal_sine" and problem.ic != "sine":
+    if not 0.0 < loss.balance_alpha <= 1.0:
+        raise ConfigError("loss.balance_alpha must lie in (0, 1]")
+    if loss.balance_every < 1:
+        raise ConfigError("loss.balance_every must be >= 1")
+    for name in ("pde", "bc", "ic_u", "ic_ut"):
+        if name not in loss.weights:
+            raise ConfigError(f"loss.weights must include {name}")
+    if problem.boundary != "dirichlet":
+        raise ConfigError(
+            "only Dirichlet targets are implemented; Neumann and absorbing "
+            "conditions are selected in AcousticWave._boundary_residual"
+        )
+    if constraints == "soft" and constraint_form != "none":
+        raise ConfigError("constraint_form must be 'none' when constraints is soft")
+    if constraints == "hard" and constraint_form == "none":
+        raise ConfigError("constraints hard requires constraint_form modal_sine or polynomial")
+    if constraint_form == "modal_sine" and problem.ic != "sine":
         raise ConfigError("modal_sine hard constraint requires problem.ic = sine")
-    if loss.hard_constraints and network.field_names != ("u",):
+    if constraints == "hard" and network.field_names != ("u",):
         raise ConfigError("hard constraints in this increment require network.field_names: [u]")
+    if constraints == "hard" and (
+        problem.boundary != "dirichlet"
+        or problem.dirichlet_value != 0.0
+        or problem.initial_velocity != 0.0
+    ):
+        raise ConfigError(
+            "the hard trial function enforces homogeneous Dirichlet data and "
+            "zero initial velocity; use constraints: soft for other targets"
+        )
     if sampling.method == "sobol":
         for name, count in (
             ("n_interior", sampling.n_interior),
@@ -356,11 +443,28 @@ def _req_str(data: dict[str, Any], key: str) -> str:
     return value
 
 
-def _req_bool(data: dict[str, Any], key: str) -> bool:
-    value = data[key]
-    if not isinstance(value, bool):
-        raise ConfigError(f"{key} must be a boolean")
-    return value
+def _optional_choice(
+    data: dict[str, Any],
+    key: str,
+    options: tuple[str, ...],
+    *,
+    default: str,
+) -> str:
+    if key not in data or data[key] is None:
+        return default
+    return _req_choice(data, key, options)
+
+
+def _optional_float(data: dict[str, Any], key: str, *, default: float) -> float:
+    if key not in data or data[key] is None:
+        return default
+    return _req_float(data, key)
+
+
+def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:
+    if key not in data or data[key] is None:
+        return default
+    return _req_int(data, key, minimum=0)
 
 
 def _req_int(data: dict[str, Any], key: str, *, minimum: int) -> int:
