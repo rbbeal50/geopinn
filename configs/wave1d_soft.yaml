@@ -1,0 +1,67 @@
+# Same IBVP as configs/wave1d.yaml, with the boundary and initial conditions
+# enforced by named loss terms instead of the trial function.
+# u = N_theta(x, t)
+# L = w_pde L_pde + w_bc L_bc + w_ic_u L_ic_u + w_ic_ut L_ic_ut
+seed: 0
+device: cpu
+log_every: 200
+checkpoint: outputs/checkpoints/wave1d_soft.pt
+constraints: soft
+
+problem:
+  length: 1.0
+  time_final: 1.0
+  wave_speed: 1.0
+  amplitude: 1.0
+  boundary: dirichlet
+  dirichlet_value: 0.0
+  ic: sine
+  initial_velocity: 0.0
+  gaussian_center: 0.5
+  gaussian_width: 0.12
+
+coefficients:
+  wave_speed:
+    form: constant
+
+network:
+  field_names: [u]
+  hidden_layers: 4
+  hidden_dim: 64
+  # Sine units match the single-harmonic standing wave. Tanh reaches
+  # about 4e-3 on this budget; sine is what gets near 1e-3.
+  activation: sin
+  sine_omega: 1.0
+  fourier_features: 0
+  fourier_sigma: 1.0
+
+sampling:
+  n_interior: 4096
+  n_boundary_per_side: 256
+  n_initial: 512
+  method: sobol
+
+loss:
+  weights:
+    pde: 1.0
+    bc: 100.0
+    ic_u: 100.0
+    ic_ut: 100.0
+    data: 0.0
+  # wang2021 is implemented and left off here. On this problem it drove
+  # the BC/IC weights to the cap while those residuals were already small,
+  # which slowed the PDE. Fixed weights of 100 keep the constraints tight
+  # without that stall. Turn balance on when the terms fight each other.
+  balance: none
+  balance_alpha: 0.9
+  balance_every: 10
+
+optim:
+  adam_steps: 1000
+  adam_lr: 0.001
+  adam_lr_gamma: 0.1
+  adam_lr_step_frac: 0.5
+  lbfgs_steps: 600
+  lbfgs_lr: 1.0
+  lbfgs_history: 50
+  lbfgs_line_search_evals: 25
