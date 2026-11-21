@@ -1,0 +1,65 @@
+# 1D acoustic forward problem. The numbers below are already nondimensional:
+#   x in [0, 1], t in [0, 1], c = 1, so c*T/L = 1.
+#   u_tt = c^2 u_xx,  u(0, t) = u(1, t) = 0,
+#   u(x, 0) = sin(pi x),  u_t(x, 0) = 0.
+# The exact solution is u = sin(pi x) cos(pi c t).
+seed: 0
+device: cpu
+log_every: 200
+checkpoint: outputs/checkpoints/wave1d.pt
+
+problem:
+  length: 1.0
+  time_final: 1.0
+  wave_speed: 1.0
+  amplitude: 1.0
+  ic: sine
+  gaussian_center: 0.5
+  gaussian_width: 0.12
+
+# constant uses problem.wave_speed. form: field plus source: <name> is the
+# slot for a trainable c(x) or a rock-physics map; the trainer does not build
+# that yet, but AcousticWave already evaluates a tensor or a callable speed.
+coefficients:
+  wave_speed:
+    form: constant
+
+network:
+  field_names: [u]
+  hidden_layers: 4
+  hidden_dim: 64
+  activation: tanh
+  sine_omega: 1.0
+  fourier_features: 0
+  fourier_sigma: 1.0
+
+sampling:
+  n_interior: 2048
+  n_boundary_per_side: 128
+  n_initial: 256
+  method: sobol
+
+loss:
+  # Names are the contract. Extra keys (data_vp, regularization_c, ...) are
+  # kept for a later module and do not affect this run.
+  weights:
+    residual: 1.0
+    bc: 100.0
+    ic: 100.0
+    ic_velocity: 100.0
+    data: 1.0
+  hard_constraints: true
+  # modal_sine builds u = sin(pi x) (1 + t^2 N) so the Dirichlet condition
+  # and both initial conditions hold exactly. polynomial is the general
+  # alternative and is required for a Gaussian initial displacement.
+  constraint_form: modal_sine
+
+optim:
+  adam_steps: 1000
+  adam_lr: 0.001
+  adam_lr_gamma: 0.1
+  adam_lr_step_frac: 0.5
+  lbfgs_steps: 100
+  lbfgs_lr: 1.0
+  lbfgs_history: 50
+  lbfgs_line_search_evals: 25
